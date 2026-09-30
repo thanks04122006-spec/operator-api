@@ -51,7 +51,7 @@ app/
     records_store.py # records.json 원자적 교체 + 백업
     upload_log.py     # 업로드 CSV 로그
     aggregation.py     # 시간대 집계, baseline, 휴관일 판정
-    congestion.py       # T04 혼잡도 판정 (midrank 백분위, 35/70 경계)
+    congestion.py       # 추정 체류 인원 혼잡도 판정 (midrank 백분위, 35/70 경계)
   routers/
     congestion.py  # GET /api/v1/congestion/today
     stats.py        # GET /api/v1/stats?date=
@@ -63,11 +63,101 @@ scripts/
 
 ## API
 
-### `GET /api/v1/meta`, `GET /api/v1/congestion/today`, `GET /api/v1/stats?date=`
+### HTML 화면 연동 안내
 
-전달하신 6절 규격 그대로 응답합니다. `data_status`는 `forecast` / `partial` /
-`actual` / `closed`를 씁니다. 휴관일은 레코드에 `is_closed_day: true`가 있거나
+배포 환경에서는 `API_BASE_URL`을 Railway에서 발급된 서버 주소로 설정하고, 경로를
+붙여 요청합니다. 로컬 개발 주소는 `http://localhost:8000`입니다. 공개 조회 API에는
+API 키가 필요하지 않습니다. 운영자 업로드에 쓰는 `ADMIN_UPLOAD_TOKEN`은 비밀값이므로
+HTML/JavaScript에 넣거나 공개 저장소에 커밋하지 마세요. 정적 HTML에서는 조회 API만
+직접 호출하고, 운영자 업로드는 토큰이 노출되지 않는 신뢰 가능한 도구에서만 요청합니다.
+
+| 화면 용도 | 메서드와 경로 | 인증 |
+|---|---|---|
+| 도서관 이름, 운영시간, 표시 가능한 단계 | `GET {API_BASE_URL}/api/v1/meta` | 없음 |
+| 오늘 시간대별 추정 체류 인원·혼잡도 | `GET {API_BASE_URL}/api/v1/congestion/today` | 없음 |
+| 날짜별 원본 IN/OUT 및 추정 체류 인원 | `GET {API_BASE_URL}/api/v1/stats?date=YYYY-MM-DD` | 없음 |
+| records 교체 업로드 | `POST {API_BASE_URL}/api/v1/admin/records` | `Bearer ADMIN_UPLOAD_TOKEN` |
+
+API 문서는 로컬 실행 시 `http://localhost:8000/docs`에서 볼 수 있습니다. 날짜는
+`YYYY-MM-DD` 형식입니다. 응답 JSON의 주요 필드는 다음과 같습니다.
+
+`GET /api/v1/meta`
+
+```json
+{
+  "library_name": "용산꿈나무도서관",
+  "available_hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+  "operating_hours": {
+    "weekday": {"open": "09:00", "close": "21:00"},
+    "weekend": {"open": "09:00", "close": "17:00"}
+  },
+  "levels": {"quiet": "여유", "normal": "보통", "busy": "혼잡"}
+}
+```
+
+`GET /api/v1/congestion/today`의 `hourly` 요소 예시:
+
+```json
+{
+  "hour": 10,
+  "estimated_present": 24,
+  "expected_visitors": 24,
+  "baseline_avg": 22.5,
+  "difference_rate": 6.7,
+  "level": "normal",
+  "score": 54.2,
+  "calculation_basis": "same_weekday_same_hour",
+  "sample_count": 4,
+  "quality_status": "forecast"
+}
+```
+
+화면에는 `estimated_present`를 **추정 체류 인원**으로 표시하세요. 기존 화면과의
+호환을 위해 `expected_visitors`도 제공하며 같은 값입니다. 실제 실시간 인원이나 좌석
+점유율을 뜻하지 않습니다. `level`은 `quiet`(여유), `normal`(보통), `busy`(혼잡)이며,
+`level`, `score`, `estimated_present`가 `null`이면 해당 시간대는 **자료 부족/추정 불가**로
+표시하고 임의로 0이나 혼잡 단계로 바꾸지 마세요. `quality_status`는 `forecast`,
+`valid`, `missing_out`, `partial`, `missing_gate`, `negative_balance`,
+`insufficient_data`, `insufficient_samples` 등이 올 수 있습니다.
+
+`GET /api/v1/stats?date=2026-09-14`는 전체 IN/OUT과 시간대 배열을 돌려줍니다.
+각 `hourly` 요소에는 원본 `in_count`, `out_count`와 추가 필드
+`estimated_present`, `quality_status`가 있습니다. OUT 원본이 결측이면 `out_count`와
+`total_out`은 `null`입니다. 기존 API 경로와 원본 필드는 유지됩니다.
+
+브라우저에서 조회하는 간단한 예시:
+
+```javascript
+const API_BASE_URL = "https://<배포된-서버-주소>";
+
+const response = await fetch(`${API_BASE_URL}/api/v1/congestion/today`);
+if (!response.ok) throw new Error(`API 오류: ${response.status}`);
+
+const data = await response.json();
+for (const hour of data.hourly) {
+  console.log(hour.hour, hour.estimated_present, hour.level, hour.quality_status);
+}
+```
+
+운영자 업로드 API 키는 별도이며 HTML 조회 코드에서 사용할 필요가 없습니다.
+
+### 공개 조회 API의 계산 기준
+
+기존 경로와 필드는 유지합니다. `/congestion/today`의 기존 `expected_visitors`는
+하위 호환을 위해 남기며, 값의 기준은 `estimated_present`(추정 체류 인원)입니다.
+새 필드 `calculation_basis`, `sample_count`, `quality_status`, `score`로 계산 근거와
+표본 수, 품질 상태, 시간대 점수를 제공합니다. `/stats`는 원본 IN/OUT을 보존하고
+시간대별 추정 체류 인원과 품질 상태를 덧붙입니다. `data_status`는 `forecast` /
+`partial` / `actual` / `closed` / `insufficient_data`를 씁니다. 휴관일은 레코드에 `is_closed_day: true`가 있거나
 `app/services/aggregation.py`의 `CLOSED_DATES` 집합에 날짜를 추가해서 지정합니다.
+
+추정은 운영일별 개장 시 0명에서 시작해 시간대별 정문·후문 IN 합계에서 OUT 합계를
+빼 누적합니다. 양쪽 출입구의 완전한 레코드와 OUT 값이 모두 확인되는 시간대만
+신뢰하며, 특히 OUT_11을 포함해 OUT 결측·누락·부분 수집·출입구 누락·음수 누적 잔액이 발생하면 그 시점부터
+해당 날짜의 추정값은 제공하지 않습니다. 과거 최근 4주 중 같은 요일·시간대 유효
+표본을 사용하고, 같은 요일 표본이 2개 미만이면 최근 4주의 같은 시간대 자료를
+보조로 사용합니다. 그마저 없으면 숫자나 혼잡 단계를 만들지 않고 `자료 부족/추정 불가`를
+반환합니다. 이는 실시간 인원이나 좌석 점유율이 아닙니다.
 
 ### `POST /api/v1/admin/records` (운영자 전용)
 

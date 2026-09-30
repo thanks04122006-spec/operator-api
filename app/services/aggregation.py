@@ -1,43 +1,80 @@
-"""4~6절: 시간대별 집계 + baseline + 혼잡도(congestion.midrank_score) + 휴관일 판정"""
+"""시간대 집계, 추정 체류 인원, 기준 예측 및 혼잡도."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 from collections import defaultdict
+from datetime import date as date_cls, datetime, timedelta
 
-from app.core.config import BASELINE_WEEKS
+from app.core.config import BASELINE_WEEKS, OPERATING_HOURS
 from app.services import congestion as congestion_calc
 from app.services.records_store import load_records
 
-# 공식 휴관일 (기존 records에 is_closed_day가 없는 날짜도 커버하고 싶으면 여기에 추가)
 CLOSED_DATES: set[str] = set()
+GATES = {"front", "back"}
+MIN_WEEKDAY_SAMPLES = 2
+
+
+def _window(date_str: str) -> range:
+    day = date_cls.fromisoformat(date_str)
+    spec = OPERATING_HOURS["weekend" if day.weekday() >= 5 else "weekday"]
+    opening = int(spec["open"].split(":")[0])
+    closing = int(spec["close"].split(":")[0])
+    return range(opening, closing)
 
 
 def _hourly_rows() -> list[dict]:
-    """records.json을 date+hour 단위로 합산 (정문+후문)."""
-    records = load_records()
+    """정문+후문 원본을 합산하고, 품질 조건이 확인된 날짜만 누적 계산한다."""
     grouped: dict[tuple[str, int], list[dict]] = defaultdict(list)
-    for r in records:
-        grouped[(r["date"], r["hour"])].append(r)
+    for record in load_records():
+        grouped[(record["date"], record["hour"])].append(record)
 
-    rows = []
+    rows: list[dict] = []
+    by_date: dict[str, list[dict]] = defaultdict(list)
     for (date_str, hour), items in grouped.items():
-        in_count = sum(r["in_count"] for r in items)
-        out_values = [r.get("out_count") for r in items]
-        out_count = None if any(v is None for v in out_values) else sum(out_values)
-        is_partial = any(r.get("is_partial") for r in items) or {r["gate"] for r in items} != {"front", "back"}
-        is_closed = any(r.get("is_closed_day") for r in items)
-        rows.append(
-            {
-                "date": date_str,
-                "hour": hour,
-                "in_count": in_count,
-                "out_count": out_count,
-                "visit_count": in_count,
-                "is_partial": is_partial,
-                "is_closed_day": is_closed,
-            }
-        )
-    return rows
+        ins = sum(r["in_count"] for r in items)
+        outs = [r.get("out_count") for r in items]
+        gates = {r["gate"] for r in items}
+        row = {
+            "date": date_str, "hour": hour, "in_count": ins,
+            "out_count": None if any(v is None for v in outs) else sum(outs),
+            "gates": gates,
+            "is_partial": any(r.get("is_partial", False) for r in items),
+            "is_closed_day": any(r.get("is_closed_day") for r in items),
+            "quality_status": "valid", "estimated_present": None,
+        }
+        rows.append(row)
+        by_date[date_str].append(row)
+
+    for date_str, day_rows in by_date.items():
+        indexed = {r["hour"]: r for r in day_rows}
+        balance = 0
+        invalid = False
+        for hour in _window(date_str):
+            row = indexed.get(hour)
+            if row is None:
+                invalid = True
+                continue
+            if invalid:
+                row["quality_status"] = "insufficient_data"
+                continue
+            if row["gates"] != GATES:
+                row["quality_status"] = "missing_gate"
+                invalid = True
+            elif row["is_partial"]:
+                row["quality_status"] = "partial"
+                invalid = True
+            elif row["out_count"] is None:
+                row["quality_status"] = "missing_out"
+                invalid = True
+            else:
+                next_balance = balance + row["in_count"] - row["out_count"]
+                if next_balance < 0:
+                    row["quality_status"] = "negative_balance"
+                    invalid = True
+                else:
+                    balance = next_balance
+                    row["estimated_present"] = balance
+        # 운영시간 외 행은 통계에서 원본만 유지하며 추정에는 포함하지 않는다.
+    return sorted(rows, key=lambda r: (r["date"], r["hour"]))
 
 
 def is_closed_date(date_str: str, rows: list[dict] | None = None) -> bool:
@@ -48,17 +85,29 @@ def is_closed_date(date_str: str, rows: list[dict] | None = None) -> bool:
     return bool(day_rows) and all(r["is_closed_day"] for r in day_rows)
 
 
-def _baseline(rows: list[dict], target_date: str, hour: int) -> float | None:
-    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
-    values = []
-    for w in range(1, BASELINE_WEEKS + 1):
-        prev_date = (target_dt - timedelta(weeks=w)).strftime("%Y-%m-%d")
-        match = next((r for r in rows if r["date"] == prev_date and r["hour"] == hour), None)
-        if match:
-            values.append(float(match["visit_count"]))
-    if not values:
-        return None
-    return round(sum(values) / len(values), 2)
+def _recent_same_hour(rows: list[dict], target_date: str, hour: int) -> list[dict]:
+    target = date_cls.fromisoformat(target_date)
+    lower = target - timedelta(weeks=BASELINE_WEEKS)
+    return [r for r in rows if lower <= date_cls.fromisoformat(r["date"]) < target
+            and r["hour"] == hour and r["estimated_present"] is not None]
+
+
+def _baseline(rows: list[dict], target_date: str, hour: int) -> tuple[float | None, int, str]:
+    candidates = _recent_same_hour(rows, target_date, hour)
+    weekday = date_cls.fromisoformat(target_date).weekday()
+    same_weekday = [r for r in candidates if date_cls.fromisoformat(r["date"]).weekday() == weekday]
+    if len(same_weekday) >= MIN_WEEKDAY_SAMPLES:
+        sample, basis = same_weekday, "same_weekday_same_hour"
+    elif candidates:
+        sample, basis = candidates, "same_hour_fallback"
+    else:
+        return None, 0, "insufficient_samples"
+    return round(sum(r["estimated_present"] for r in sample) / len(sample), 2), len(sample), basis
+
+
+def _historical_distribution(rows: list[dict], hour: int, exclude_date: str | None = None) -> list[float]:
+    return [float(r["estimated_present"]) for r in rows
+            if r["hour"] == hour and r["date"] != exclude_date and r["estimated_present"] is not None]
 
 
 def _difference_rate(actual: float, baseline: float | None) -> float | None:
@@ -67,108 +116,91 @@ def _difference_rate(actual: float, baseline: float | None) -> float | None:
     return round((actual - baseline) / baseline * 100, 1)
 
 
-def _historical_distribution(rows: list[dict], hour: int, exclude_date: str | None = None) -> list[float]:
-    return [float(r["visit_count"]) for r in rows if r["hour"] == hour and r["date"] != exclude_date]
-
-
 def stats_for_date(date_str: str) -> dict | None:
-    """GET /api/v1/stats?date= 용 집계. 데이터가 전혀 없으면 None."""
     rows = _hourly_rows()
-
     if is_closed_date(date_str, rows):
-        return {
-            "date": date_str,
-            "data_status": "closed",
-            "total_in": 0,
-            "total_out": 0,
-            "hourly": [],
-        }
-
-    day_rows = sorted([r for r in rows if r["date"] == date_str], key=lambda r: r["hour"])
+        return {"date": date_str, "data_status": "closed", "total_in": 0,
+                "total_out": 0, "hourly": []}
+    day_rows = sorted((r for r in rows if r["date"] == date_str), key=lambda r: r["hour"])
     if not day_rows:
         return None
-
     total_in = sum(r["in_count"] for r in day_rows)
-    out_values = [r["out_count"] for r in day_rows]
-    total_out = 0 if any(v is None for v in out_values) else sum(out_values)
-    is_partial = any(r["is_partial"] for r in day_rows) or len(day_rows) < 16
-
-    return {
-        "date": date_str,
-        "data_status": "partial" if is_partial else "actual",
-        "total_in": total_in,
-        "total_out": total_out,
-        "hourly": [{"hour": r["hour"], "in_count": r["in_count"], "out_count": r["out_count"]} for r in day_rows],
-    }
+    total_out = None if any(r["out_count"] is None for r in day_rows) else sum(r["out_count"] for r in day_rows)
+    window = _window(date_str)
+    qualities = {r["quality_status"] for r in day_rows if r["hour"] in window}
+    observed_hours = {r["hour"] for r in day_rows}
+    status = "actual" if qualities <= {"valid"} and set(window) <= observed_hours else "insufficient_data"
+    hourly = []
+    for r in day_rows:
+        item = {"hour": r["hour"], "in_count": r["in_count"], "out_count": r["out_count"]}
+        if r["hour"] in _window(date_str):
+            item.update(estimated_present=r["estimated_present"], quality_status=r["quality_status"])
+        hourly.append(item)
+    return {"date": date_str, "data_status": status, "total_in": total_in,
+            "total_out": total_out, "hourly": hourly}
 
 
 def today_forecast() -> dict:
-    """GET /api/v1/congestion/today 용 예측."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    current_hour = datetime.now().hour
+    now = datetime.now()
+    today, current_hour = now.strftime("%Y-%m-%d"), now.hour
     rows = _hourly_rows()
-
+    timestamp = now.strftime("%Y-%m-%dT%H:%M:%S+09:00")
     if is_closed_date(today, rows):
-        return {
-            "date": today,
-            "data_status": "closed",
-            "reference_time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-            "congestion": {"level": None, "label": "휴관일", "score": None},
-            "recommendation": {"best_start_hour": 0, "best_end_hour": 0, "message": "오늘은 휴관일입니다."},
-            "hourly": [],
-            "updated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-        }
+        return {"date": today, "data_status": "closed", "reference_time": timestamp,
+                "congestion": {"level": None, "label": "휴관일", "score": None},
+                "recommendation": {"best_start_hour": 0, "best_end_hour": 0, "message": "오늘은 휴관일입니다."},
+                "hourly": [], "updated_at": timestamp}
 
-    today_rows = {r["hour"]: r for r in rows if r["date"] == today}
-
+    today_by_hour = {r["hour"]: r for r in rows if r["date"] == today}
     hourly_result = []
-    for hour in range(8, 24):
-        baseline = _baseline(rows, today, hour)
-        if hour in today_rows:
-            expected = int(today_rows[hour]["visit_count"])
-        elif baseline is not None:
-            expected = int(round(baseline))
+    window_hours = list(_window(today))
+    for hour in _window(today):
+        current = today_by_hour.get(hour)
+        baseline, sample_count, basis = _baseline(rows, today, hour)
+        actual_estimate = current["estimated_present"] if current else None
+        if actual_estimate is not None:
+            estimate = actual_estimate
+        elif current is not None:
+            estimate = None
         else:
-            expected = 0
-
-        diff = _difference_rate(expected, baseline)
+            prior_hours = [h for h in window_hours if h < hour]
+            prior_complete = all(
+                h in today_by_hour and today_by_hour[h]["estimated_present"] is not None
+                for h in prior_hours
+            )
+            # 유효한 당일 누적 이후의 아직 도래하지 않은 시간은 기준 예측을 쓴다.
+            # 지나간 시간의 누락/불량은 뒤 시간대의 기준값으로 덮지 않는다.
+            estimate = round(baseline) if (not today_by_hour or (hour > current_hour and prior_complete)) and baseline is not None else None
+        quality = current["quality_status"] if current else (
+            "forecast" if estimate is not None and today_by_hour else
+            "insufficient_data" if today_by_hour and estimate is None else
+            "forecast" if baseline is not None else "insufficient_samples"
+        )
+        source = "observed_cumulative" if actual_estimate is not None else basis
         dist = _historical_distribution(rows, hour, exclude_date=today)
-        if dist:
-            score, level = congestion_calc.midrank_score(expected, dist)
+        if estimate is not None and dist:
+            score, level = congestion_calc.midrank_score(estimate, dist)
         else:
             score, level = None, None
+        hourly_result.append({"hour": hour, "expected_visitors": estimate,
+                              "estimated_present": estimate, "baseline_avg": baseline,
+                              "difference_rate": _difference_rate(estimate, baseline) if estimate is not None else None,
+                              "level": level, "score": score, "calculation_basis": source,
+                              "sample_count": sample_count, "quality_status": quality})
 
-        hourly_result.append(
-            {"hour": hour, "expected_visitors": expected, "baseline_avg": baseline, "difference_rate": diff, "level": level}
-        )
-
-    current = next((h for h in hourly_result if h["hour"] == current_hour), hourly_result[0])
-    dist_now = _historical_distribution(rows, current["hour"], exclude_date=today)
-    if dist_now:
-        score_now, level_now = congestion_calc.midrank_score(current["expected_visitors"], dist_now)
-    else:
-        score_now, level_now = None, None
-
-    candidates = [h for h in hourly_result if h["level"] in (None, "quiet", "normal")] or hourly_result
-    best_hour = min(candidates, key=lambda h: h["expected_visitors"])["hour"]
-    best_start, best_end = best_hour, min(best_hour + 2, 23 + 1)
-
-    return {
-        "date": today,
-        "data_status": "forecast" if not today_rows else "partial",
-        "reference_time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-        "congestion": {
-            "level": level_now,
-            "label": congestion_calc.label(level_now) if level_now else "예측 자료 없음",
-            "score": score_now,
-        },
-        "recommendation": {
-            "best_start_hour": best_start,
-            "best_end_hour": best_end,
-            "message": f"오전 {best_start}시~{best_end}시 방문을 추천합니다."
-            if best_start < 12
-            else f"{best_start}시~{best_end}시 방문을 추천합니다.",
-        },
-        "hourly": hourly_result,
-        "updated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-    }
+    current_row = next((h for h in hourly_result if h["hour"] == current_hour), None)
+    if current_row is None:
+        current_row = next((h for h in hourly_result if h["hour"] > current_hour), hourly_result[-1] if hourly_result else None)
+    level = current_row["level"] if current_row else None
+    score = current_row["score"] if current_row else None
+    recommendation_candidates = [h for h in hourly_result if h["estimated_present"] is not None and h["level"] in ("quiet", "normal")]
+    if not recommendation_candidates:
+        recommendation_candidates = [h for h in hourly_result if h["estimated_present"] is not None]
+    best_hour = min(recommendation_candidates, key=lambda h: h["estimated_present"])["hour"] if recommendation_candidates else 0
+    best_end = min(best_hour + 2, _window(today).stop) if best_hour else 0
+    return {"date": today, "data_status": "partial" if today_by_hour else "forecast",
+            "reference_time": timestamp,
+            "congestion": {"level": level, "label": congestion_calc.label(level) if level else "자료 부족/추정 불가", "score": score},
+            "recommendation": {"best_start_hour": best_hour, "best_end_hour": best_end,
+                               "message": f"{best_hour}시~{best_end}시 방문을 추천합니다." if best_hour else "자료 부족으로 추천할 수 없습니다."},
+            "hourly": hourly_result, "updated_at": timestamp}

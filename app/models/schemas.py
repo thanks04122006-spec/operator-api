@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 Gate = Literal["front", "back"]
 Level = Literal["quiet", "normal", "busy"]
-DataStatus = Literal["forecast", "partial", "actual", "closed"]
+DataStatus = Literal["forecast", "partial", "actual", "closed", "insufficient_data"]
 
 
 class RecordItem(BaseModel):
@@ -69,10 +69,15 @@ class Recommendation(BaseModel):
 
 class TodayHourly(BaseModel):
     hour: int
-    expected_visitors: int
+    expected_visitors: Optional[int] = None  # 기존 필드 유지, 의미는 estimated_present와 동일
+    estimated_present: Optional[int] = None
     baseline_avg: Optional[float] = None
     difference_rate: Optional[float] = None
     level: Optional[Level] = None
+    score: Optional[float] = None
+    calculation_basis: str = "insufficient_samples"
+    sample_count: int = 0
+    quality_status: str = "insufficient_samples"
 
 
 class TodayCongestionResponse(BaseModel):
@@ -89,11 +94,13 @@ class StatsHourly(BaseModel):
     hour: int
     in_count: int
     out_count: Optional[int] = None
+    estimated_present: Optional[int] = None
+    quality_status: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
     date: str
     data_status: DataStatus
     total_in: int
-    total_out: int
+    total_out: Optional[int]
     hourly: list[StatsHourly]
